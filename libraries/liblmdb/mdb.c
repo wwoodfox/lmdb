@@ -4419,7 +4419,7 @@ mdb_env_write_meta(MDB_txn *txn)
 			if (!recent || env->me_metas[i]->mm_txnid > recent->mm_txnid)
 				recent = env->me_metas[i];
 		}
-		mapsize = recent ? recent->mm_mapsize : 0;
+		mapsize = recent ? recent->mm_mapsize : env->me_mapsize;
 	}
 	/* Persist any increases of mapsize config */
 	if (mapsize < env->me_mapsize)
@@ -4547,6 +4547,7 @@ mdb_meta_sign(const MDB_meta *meta)
 {
 	uint64_t sign = MDB_DATASIGN_NONE;
 	if (meta->mm_txnid != 0) {
+		/* Knuth's LCG constants from MMIX for deterministic hashing */
 		sign = (meta->mm_txnid * UINT64_C(6364136223846793005))
 			+ UINT64_C(1442695040888963407);
 		/* Ensure the sign is > MDB_DATASIGN_WEAK */
@@ -10689,7 +10690,7 @@ mdb_env_copyfd1(MDB_env *env, HANDLE fd)
 		mm->mm_dbs[MAIN_DBI].md_flags = txn->mt_dbs[MAIN_DBI].md_flags;
 	}
 	if (root != P_INVALID || mm->mm_dbs[MAIN_DBI].md_flags) {
-		mm->mm_txnid = 2;		/* use metapage 2 */
+		mm->mm_txnid = NUM_METAS - 1;		/* use last metapage */
 		mm->mm_datasync_sign = mdb_meta_sign(mm);
 	}
 
