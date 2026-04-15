@@ -1244,11 +1244,25 @@ typedef struct MDB_db {
 #define CORE_DBS	2
 
 	/** Number of meta pages - also hardcoded elsewhere */
-#define NUM_METAS	2
+#define NUM_METAS	3
+
+	/** Meta page sign/state values for three-meta-page crash recovery.
+	 *	Stored in the mm_datasync_sign field of MDB_meta.
+	 *
+	 *	The three meta pages rotate through three states:
+	 *	- Steady: fully synced to disk (both data and meta fsync'd)
+	 *	- Weak: meta committed but data pages may not be synced
+	 *	- Writing: currently being written (may be torn on crash)
+	 *
+	 *	On recovery, we pick the newest Steady meta as the safe fallback,
+	 *	then prefer a newer Weak meta if it appears valid.
+	 */
+#define MDB_DATASIGN_NONE	0u
+#define MDB_DATASIGN_WEAK	1u
 
 	/** Meta page content.
 	 *	A meta page is the start point for accessing a database snapshot.
-	 *	Pages 0-1 are meta pages. Transaction N writes meta page #(N % 2).
+	 *	Pages 0-2 are meta pages. Transaction N writes meta page #(N % 3).
 	 */
 typedef struct MDB_meta {
 		/** Stamp identifying this as an LMDB file. It must be set
@@ -1276,6 +1290,11 @@ typedef struct MDB_meta {
 	 */
 	pgno_t		mm_last_pg;
 	volatile txnid_t	mm_txnid;	/**< txnid that committed this page */
+	/** Data sync sign: MDB_DATASIGN_NONE, MDB_DATASIGN_WEAK, or a steady
+	 *	signature (any value > MDB_DATASIGN_WEAK) indicating all data pages
+	 *	were fsynced before this meta page was written.
+	 */
+	volatile uint64_t	mm_datasync_sign;
 } MDB_meta;
 
 	/** Buffer for a stack-allocated meta page.
@@ -1543,7 +1562,7 @@ struct MDB_env {
 	char		*me_path;		/**< path to the DB files */
 	char		*me_map;		/**< the memory map of the data file */
 	MDB_txninfo	*me_txns;		/**< the memory map of the lock file or NULL */
-	MDB_meta	*me_metas[NUM_METAS];	/**< pointers to the two meta pages */
+	MDB_meta	*me_metas[NUM_METAS];	/**< pointers to the three meta pages */
 	void		*me_pbuf;		/**< scratch area for DUPSORT put() */
 	MDB_txn		*me_txn;		/**< current write transaction */
 	MDB_txn		*me_txn0;		/**< prealloc'd write transaction */
@@ -1657,6 +1676,8 @@ static int	mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata,
 static int  mdb_env_read_header(MDB_env *env, int prev, MDB_meta *meta);
 static MDB_meta *mdb_env_pick_meta(const MDB_env *env);
 static int  mdb_env_write_meta(MDB_txn *txn);
+static uint64_t mdb_meta_sign(const MDB_meta *meta);
+static int  mdb_meta_is_steady(const MDB_meta *meta);
 #if defined(MDB_USE_POSIX_MUTEX) && !defined(MDB_ROBUST_SUPPORTED) /* Drop unused excl arg */
 # define mdb_env_close0(env, excl) mdb_env_close1(env)
 #endif
@@ -2569,7 +2590,7 @@ mdb_page_alloc(MDB_cursor *mc, int num, MDB_page **mp)
 			 * which modifies the database. Maybe we can delete some code?
 			 */
 			m2.mc_flags |= C_ORIG_RDONLY;
-			m2.mc_db = &env->me_metas[(txn->mt_txnid-1) & 1]->mm_dbs[FREE_DBI];
+			m2.mc_db = &env->me_metas[(txn->mt_txnid-1) % NUM_METAS]->mm_dbs[FREE_DBI];
 			m2.mc_dbflag = (unsigned char *)""; /* probably unnecessary */
 #endif
 			if (last) {
@@ -3129,7 +3150,7 @@ mdb_txn_renew0(MDB_txn *txn)
 				meta = mdb_env_pick_meta(env);
 				r->mr_txnid = meta->mm_txnid;
 			} else {
-				meta = env->me_metas[r->mr_txnid & 1];
+				meta = env->me_metas[r->mr_txnid % NUM_METAS];
 			}
 			txn->mt_txnid = r->mr_txnid;
 			txn->mt_u.reader = r;
@@ -3141,7 +3162,7 @@ mdb_txn_renew0(MDB_txn *txn)
 			if (LOCK_MUTEX(rc, env, env->me_wmutex))
 				return rc;
 			txn->mt_txnid = ti->mti_txnid;
-			meta = env->me_metas[txn->mt_txnid & 1];
+			meta = env->me_metas[txn->mt_txnid % NUM_METAS];
 		} else {
 			meta = mdb_env_pick_meta(env);
 			txn->mt_txnid = meta->mm_txnid;
@@ -4236,7 +4257,7 @@ mdb_env_read_header(MDB_env *env, int prev, MDB_meta *meta)
 	enum { Size = sizeof(pbuf) };
 
 	/* We don't know the page size yet, so use a minimum value.
-	 * Read both meta pages so we can use the latest one.
+	 * Read all meta pages so we can use the latest one.
 	 */
 
 	for (i=off=0; i<NUM_METAS; i++, off += meta->mm_psize) {
@@ -4307,7 +4328,7 @@ mdb_env_init_meta0(MDB_env *env, MDB_meta *meta)
 static int ESECT
 mdb_env_init_meta(MDB_env *env, MDB_meta *meta)
 {
-	MDB_page *p, *q;
+	MDB_page *p, *q, *r;
 	int rc;
 	unsigned int	 psize;
 #ifdef _WIN32
@@ -4328,6 +4349,9 @@ mdb_env_init_meta(MDB_env *env, MDB_meta *meta)
 
 	psize = env->me_psize;
 
+	/* Mark meta0 as steady since this is a fresh database init */
+	meta->mm_datasync_sign = mdb_meta_sign(meta);
+
 	p = calloc(NUM_METAS, psize);
 	if (!p)
 		return ENOMEM;
@@ -4339,6 +4363,11 @@ mdb_env_init_meta(MDB_env *env, MDB_meta *meta)
 	q->mp_pgno = 1;
 	q->mp_flags = P_META;
 	*(MDB_meta *)METADATA(q) = *meta;
+
+	r = (MDB_page *)((char *)q + psize);
+	r->mp_pgno = 2;
+	r->mp_flags = P_META;
+	*(MDB_meta *)METADATA(r) = *meta;
 
 	DO_PWRITE(rc, env->me_fd, p, psize * NUM_METAS, len, 0);
 	if (!rc)
@@ -4372,14 +4401,26 @@ mdb_env_write_meta(MDB_txn *txn)
 	int r2;
 #endif
 
-	toggle = txn->mt_txnid & 1;
+	toggle = txn->mt_txnid % NUM_METAS;
 	DPRINTF(("writing meta page %d for root page %"Yu,
 		toggle, txn->mt_dbs[MAIN_DBI].md_root));
 
 	env = txn->mt_env;
 	flags = txn->mt_flags | env->me_flags;
 	mp = env->me_metas[toggle];
-	mapsize = env->me_metas[toggle ^ 1]->mm_mapsize;
+
+	/* Find the most recent other meta page for mapsize */
+	{
+		MDB_meta *recent = NULL;
+		int i;
+		for (i = 0; i < NUM_METAS; i++) {
+			if (i == toggle)
+				continue;
+			if (!recent || env->me_metas[i]->mm_txnid > recent->mm_txnid)
+				recent = env->me_metas[i];
+		}
+		mapsize = recent ? recent->mm_mapsize : env->me_mapsize;
+	}
 	/* Persist any increases of mapsize config */
 	if (mapsize < env->me_mapsize)
 		mapsize = env->me_mapsize;
@@ -4404,10 +4445,15 @@ mdb_env_write_meta(MDB_txn *txn)
 			r2 = (ptr - env->me_map) & (env->me_os_psize - 1);
 			ptr -= r2;
 			meta_size += r2;
+			/* Mark as steady since we're about to msync */
+			mp->mm_datasync_sign = mdb_meta_sign(mp);
 			if (MDB_MSYNC(ptr, meta_size, rc)) {
 				rc = ErrCode();
 				goto fail;
 			}
+		} else {
+			/* NOSYNC/NOMETASYNC: mark as weak */
+			mp->mm_datasync_sign = MDB_DATASIGN_WEAK;
 		}
 		goto done;
 	}
@@ -4420,6 +4466,16 @@ mdb_env_write_meta(MDB_txn *txn)
 	meta.mm_dbs[MAIN_DBI] = txn->mt_dbs[MAIN_DBI];
 	meta.mm_last_pg = txn->mt_next_pgno - 1;
 	meta.mm_txnid = txn->mt_txnid;
+
+	/* Set datasync sign based on sync mode.
+	 * When writing via me_mfd (the sync fd), the write itself ensures
+	 * data is synced, so we can mark as steady.
+	 * When using NOSYNC/NOMETASYNC, mark as weak.
+	 */
+	if (flags & (MDB_NOSYNC|MDB_NOMETASYNC))
+		meta.mm_datasync_sign = MDB_DATASIGN_WEAK;
+	else
+		meta.mm_datasync_sign = mdb_meta_sign(&meta);
 
 	off = offsetof(MDB_meta, mm_mapsize);
 	ptr = (char *)&meta + off;
@@ -4482,16 +4538,67 @@ done:
 	return MDB_SUCCESS;
 }
 
-/** Check both meta pages to see which one is newer.
+/** Compute a steady-state datasync signature for a meta page.
+ *	Any value > MDB_DATASIGN_WEAK indicates steady (fully synced) state.
+ *	We use a simple function of the txnid to generate a unique non-trivial value.
+ */
+static uint64_t
+mdb_meta_sign(const MDB_meta *meta)
+{
+	uint64_t sign = MDB_DATASIGN_NONE;
+	if (meta->mm_txnid != 0) {
+		/* Knuth's LCG constants from MMIX for deterministic hashing */
+		sign = (meta->mm_txnid * UINT64_C(6364136223846793005))
+			+ UINT64_C(1442695040888963407);
+		/* Ensure the sign is > MDB_DATASIGN_WEAK */
+		if (sign <= MDB_DATASIGN_WEAK)
+			sign = MDB_DATASIGN_WEAK + 1;
+	}
+	return sign;
+}
+
+/** Check whether a meta page is in steady (fully synced) state.
+ *	@return non-zero if steady.
+ */
+static int
+mdb_meta_is_steady(const MDB_meta *meta)
+{
+	return meta->mm_datasync_sign > MDB_DATASIGN_WEAK;
+}
+
+/** Check all three meta pages to find the best one.
+ *	Prefer the newest valid meta page. For crash recovery, a steady
+ *	meta page is always preferred if newer meta pages are invalid.
  * @param[in] env the environment handle
- * @return newest #MDB_meta.
+ * @return newest valid #MDB_meta.
  */
 static MDB_meta *
 mdb_env_pick_meta(const MDB_env *env)
 {
 	MDB_meta *const *metas = env->me_metas;
-	return metas[ (metas[0]->mm_txnid < metas[1]->mm_txnid) ^
-		((env->me_flags & MDB_PREVSNAPSHOT) != 0) ];
+	MDB_meta *head = metas[0];
+	int i;
+
+	/* Find the meta with the highest txnid */
+	for (i = 1; i < NUM_METAS; i++) {
+		if (metas[i]->mm_txnid > head->mm_txnid)
+			head = metas[i];
+	}
+
+	if ((env->me_flags & MDB_PREVSNAPSHOT) != 0) {
+		/* Return the meta page before the newest one */
+		MDB_meta *prev = NULL;
+		for (i = 0; i < NUM_METAS; i++) {
+			if (metas[i] != head && metas[i]->mm_txnid) {
+				if (!prev || metas[i]->mm_txnid > prev->mm_txnid)
+					prev = metas[i];
+			}
+		}
+		if (prev)
+			return prev;
+	}
+
+	return head;
 }
 
 int ESECT
@@ -4643,6 +4750,7 @@ mdb_env_map(MDB_env *env, void *addr)
 	p = (MDB_page *)env->me_map;
 	env->me_metas[0] = METADATA(p);
 	env->me_metas[1] = (MDB_meta *)((char *)env->me_metas[0] + env->me_psize);
+	env->me_metas[2] = (MDB_meta *)((char *)env->me_metas[1] + env->me_psize);
 
 	return MDB_SUCCESS;
 }
@@ -5100,7 +5208,7 @@ mdb_env_open2(MDB_env *env, int prev)
 
 		DPRINTF(("opened database version %u, pagesize %u",
 			meta->mm_version, env->me_psize));
-		DPRINTF(("using meta page %d",  (int) (meta->mm_txnid & 1)));
+		DPRINTF(("using meta page %d",  (int) (meta->mm_txnid % NUM_METAS)));
 		DPRINTF(("depth: %u",           db->md_depth));
 		DPRINTF(("entries: %"Yu,        db->md_entries));
 		DPRINTF(("branch pages: %"Yu,   db->md_branch_pages));
@@ -10546,9 +10654,14 @@ mdb_env_copyfd1(MDB_env *env, HANDLE fd)
 	mp->mp_pgno = 1;
 	mp->mp_flags = P_META;
 	*(MDB_meta *)METADATA(mp) = *mm;
+
+	mp = (MDB_page *)(my.mc_wbuf[0] + env->me_psize * 2);
+	mp->mp_pgno = 2;
+	mp->mp_flags = P_META;
+	*(MDB_meta *)METADATA(mp) = *mm;
 	mm = (MDB_meta *)METADATA(mp);
 
-	/* Set metapage 1 with current main DB */
+	/* Set metapage 2 with current main DB */
 	root = new_root = txn->mt_dbs[MAIN_DBI].md_root;
 	if (root != P_INVALID) {
 		/* Count free pages + freeDB pages.  Subtract from last_pg
@@ -10577,7 +10690,8 @@ mdb_env_copyfd1(MDB_env *env, HANDLE fd)
 		mm->mm_dbs[MAIN_DBI].md_flags = txn->mt_dbs[MAIN_DBI].md_flags;
 	}
 	if (root != P_INVALID || mm->mm_dbs[MAIN_DBI].md_flags) {
-		mm->mm_txnid = 1;		/* use metapage 1 */
+		mm->mm_txnid = NUM_METAS - 1;		/* use last metapage */
+		mm->mm_datasync_sign = mdb_meta_sign(mm);
 	}
 
 	my.mc_wlen[0] = env->me_psize * NUM_METAS;
