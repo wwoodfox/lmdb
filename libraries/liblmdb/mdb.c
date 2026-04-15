@@ -2989,12 +2989,16 @@ mdb_env_sync(MDB_env *env, int force)
 			/* Write the sign field to disk via the sync fd.
 			 * Use me_mfd to ensure the write is durable.
 			 */
-			int i, meta_idx = 0;
+			int i;
 			off_t off;
-			for (i = 0; i < NUM_METAS; i++) {
-				if (env->me_metas[i] == m) { meta_idx = i; break; }
+			/* Find which meta page index 'm' corresponds to.
+			 * This always succeeds since 'm' comes from mdb_env_pick_meta.
+			 */
+			for (i = NUM_METAS; --i > 0; ) {
+				if (env->me_metas[i] == m)
+					break;
 			}
-			off = meta_idx * env->me_psize + PAGEHDRSZ
+			off = i * env->me_psize + PAGEHDRSZ
 				+ offsetof(MDB_meta, mm_datasync_sign);
 #ifdef _WIN32
 			{
@@ -3004,6 +3008,8 @@ mdb_env_sync(MDB_env *env, int force)
 				ov.Offset = (DWORD)off;
 				if (!WriteFile(env->me_mfd, &sign, sizeof(sign), &len, &ov))
 					rc = ErrCode();
+				else if (len != sizeof(sign))
+					rc = EIO;
 				else if (MDB_FDATASYNC(env->me_mfd))
 					rc = ErrCode();
 			}
