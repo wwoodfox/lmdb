@@ -1678,6 +1678,7 @@ static MDB_meta *mdb_env_pick_meta(const MDB_env *env);
 static int  mdb_env_write_meta(MDB_txn *txn);
 static uint64_t mdb_meta_sign(const MDB_meta *meta);
 static int  mdb_meta_is_steady(const MDB_meta *meta);
+static MDB_meta *mdb_meta_recent_steady(const MDB_env *env);
 #if defined(MDB_USE_POSIX_MUTEX) && !defined(MDB_ROBUST_SUPPORTED) /* Drop unused excl arg */
 # define mdb_env_close0(env, excl) mdb_env_close1(env)
 #endif
@@ -2459,15 +2460,35 @@ done:
 	return rc;
 }
 
-/** Find oldest txnid still referenced. Expects txn->mt_txnid > 0. */
+/** Find oldest txnid still referenced. Expects txn->mt_txnid > 0.
+ *
+ *	With three meta pages and the steady/weak model, the last steady
+ *	(fully synced) meta page must be protected from page reclamation.
+ *	On power failure, recovery falls back to the newest steady meta,
+ *	so all pages it references must remain intact on disk. The steady
+ *	meta's txnid is used as a floor for 'oldest', preventing free page
+ *	reclamation from overwriting pages that the steady snapshot needs.
+ */
 static txnid_t
 mdb_find_oldest(MDB_txn *txn)
 {
 	int i;
 	txnid_t mr, oldest = txn->mt_txnid - 1;
-	if (txn->mt_env->me_txns) {
-		MDB_reader *r = txn->mt_env->me_txns->mti_readers;
-		for (i = txn->mt_env->me_txns->mti_numreaders; --i >= 0; ) {
+	MDB_env *env = txn->mt_env;
+
+	/* Use the newest steady meta's txnid as a floor for 'oldest'.
+	 * Pages freed by transactions after the steady point are still
+	 * needed by the steady meta's B-tree for crash recovery.
+	 */
+	{
+		MDB_meta *steady = mdb_meta_recent_steady(env);
+		if (steady && steady->mm_txnid < oldest)
+			oldest = steady->mm_txnid;
+	}
+
+	if (env->me_txns) {
+		MDB_reader *r = env->me_txns->mti_readers;
+		for (i = env->me_txns->mti_numreaders; --i >= 0; ) {
 			if (r[i].mr_pid) {
 				mr = r[i].mr_txnid;
 				if (oldest > mr)
@@ -2938,7 +2959,72 @@ int
 mdb_env_sync(MDB_env *env, int force)
 {
 	MDB_meta *m = mdb_env_pick_meta(env);
-	return mdb_env_sync0(env, force, m->mm_last_pg+1);
+	int rc = mdb_env_sync0(env, force, m->mm_last_pg+1);
+
+	/* After successfully syncing data pages, advance the steady point
+	 * by marking the head meta as steady. This allows mdb_find_oldest()
+	 * to move its floor forward, enabling page reclamation for
+	 * transactions between the old and new steady points.
+	 * Without this, NOSYNC/NOMETASYNC users would never advance the
+	 * steady point, causing unbounded database growth.
+	 */
+	if (rc == MDB_SUCCESS && !mdb_meta_is_steady(m)) {
+		uint64_t sign = mdb_meta_sign(m);
+#ifndef _WIN32
+		if (env->me_flags & MDB_WRITEMAP) {
+			m->mm_datasync_sign = sign;
+			/* Sync the meta page to persist the steady sign */
+			{
+				unsigned meta_size = env->me_psize;
+				char *ptr = (char *)m - PAGEHDRSZ;
+				int r2 = (ptr - env->me_map) & (env->me_os_psize - 1);
+				ptr -= r2;
+				meta_size += r2;
+				if (MDB_MSYNC(ptr, meta_size, MS_SYNC))
+					rc = ErrCode();
+			}
+		} else
+#endif
+		{
+			/* Write the sign field to disk via the sync fd.
+			 * Use me_mfd to ensure the write is durable.
+			 */
+			int i, meta_idx = 0;
+			off_t off;
+			for (i = 0; i < NUM_METAS; i++) {
+				if (env->me_metas[i] == m) { meta_idx = i; break; }
+			}
+			off = meta_idx * env->me_psize + PAGEHDRSZ
+				+ offsetof(MDB_meta, mm_datasync_sign);
+#ifdef _WIN32
+			{
+				OVERLAPPED ov;
+				DWORD len;
+				memset(&ov, 0, sizeof(ov));
+				ov.Offset = (DWORD)off;
+				if (!WriteFile(env->me_mfd, &sign, sizeof(sign), &len, &ov))
+					rc = ErrCode();
+				else if (MDB_FDATASYNC(env->me_mfd))
+					rc = ErrCode();
+			}
+#else
+			{
+				int len;
+retry_sign:
+				len = pwrite(env->me_mfd, &sign, sizeof(sign), off);
+				if (len != sizeof(sign)) {
+					rc = len < 0 ? ErrCode() : EIO;
+					if (rc == EINTR)
+						goto retry_sign;
+				} else if (MDB_FDATASYNC(env->me_mfd)) {
+					rc = ErrCode();
+				}
+			}
+#endif
+		}
+	}
+
+	return rc;
 }
 
 /** Back up parent txn's cursors, then grab the originals for tracking */
@@ -4566,6 +4652,27 @@ mdb_meta_is_steady(const MDB_meta *meta)
 	return meta->mm_datasync_sign > MDB_DATASIGN_WEAK;
 }
 
+/** Find the newest meta page in steady (fully synced) state.
+ *	Used by mdb_find_oldest() to determine the safe lower bound for
+ *	page reclamation, and by recovery code to find a known-good state.
+ * @param[in] env the environment handle
+ * @return pointer to the newest steady meta, or NULL if none is steady.
+ */
+static MDB_meta *
+mdb_meta_recent_steady(const MDB_env *env)
+{
+	MDB_meta *const *metas = env->me_metas;
+	MDB_meta *steady = NULL;
+	int i;
+	for (i = NUM_METAS; --i >= 0; ) {
+		if (metas[i]->mm_txnid && mdb_meta_is_steady(metas[i])) {
+			if (!steady || metas[i]->mm_txnid > steady->mm_txnid)
+				steady = metas[i];
+		}
+	}
+	return steady;
+}
+
 /** Check all three meta pages to find the best one.
  *	Prefer the newest valid meta page. For crash recovery, a steady
  *	meta page is always preferred if newer meta pages are invalid.
@@ -5301,6 +5408,18 @@ mdb_env_share_locks(MDB_env *env, int *excl)
 {
 	int rc = 0;
 	MDB_meta *meta = mdb_env_pick_meta(env);
+
+	/* For crash recovery safety: if the newest meta is not steady
+	 * (data pages may not have been synced to disk), fall back to
+	 * the newest steady meta. This ensures the database starts from
+	 * a known-good state after a crash. For clean shutdowns with
+	 * NOSYNC, call mdb_env_sync() before closing to avoid rollback.
+	 */
+	if (!mdb_meta_is_steady(meta)) {
+		MDB_meta *steady = mdb_meta_recent_steady(env);
+		if (steady)
+			meta = steady;
+	}
 
 	env->me_txns->mti_txnid = meta->mm_txnid;
 
